@@ -331,6 +331,47 @@ main() {
         exit 1
     fi
 
+    declare -A existing_channel_by_file=()
+    declare -A existing_path_by_file=()
+    declare -A authorized_path_seen=()
+    declare -a authorized_paths=()
+    local max_channel max_channel_file persisted_max
+    max_channel=$((CHANNEL_BASE - 1))
+    max_channel_file="${STREAM_MAP_FILE}.max_channel"
+    authorized_paths+=("~^${PATH_PREFIX}/.*$")
+    authorized_path_seen["~^${PATH_PREFIX}/.*$"]=1
+
+    if [[ -f "$STREAM_MAP_FILE" ]]; then
+        local old_channel old_path old_file
+        while IFS=$'\t' read -r old_channel old_path old_file; do
+            [[ -n "${old_channel:-}" && -n "${old_path:-}" && -n "${old_file:-}" ]] || continue
+            [[ "$old_channel" =~ ^[0-9]+$ ]] || continue
+
+            existing_channel_by_file["$old_file"]="$old_channel"
+            existing_path_by_file["$old_file"]="$old_path"
+
+            if (( old_channel > max_channel )); then
+                max_channel="$old_channel"
+            fi
+        done < "$STREAM_MAP_FILE"
+    fi
+
+    if [[ -f "$max_channel_file" ]]; then
+        read -r persisted_max < "$max_channel_file" || persisted_max=""
+        if [[ "$persisted_max" =~ ^[0-9]+$ ]] && (( persisted_max > max_channel )); then
+            max_channel="$persisted_max"
+        fi
+    fi
+
+    local file existing_path
+    for file in "${files[@]}"; do
+        existing_path="${existing_path_by_file[$file]:-}"
+        if [[ -n "$existing_path" && -z "${authorized_path_seen[$existing_path]:-}" ]]; then
+            authorized_paths+=("$existing_path")
+            authorized_path_seen["$existing_path"]=1
+        fi
+    done
+
     : > "$STREAM_MAP_FILE"
 
     {
@@ -349,10 +390,13 @@ main() {
         echo "  - user: $(yaml_quote "$RTSP_USER")"
         echo "    pass: $(yaml_quote "$RTSP_PASS")"
         echo "    permissions:"
-        echo "      - action: publish"
-        echo "        path: $(yaml_quote "~^${PATH_PREFIX}/.*$")"
-        echo "      - action: read"
-        echo "        path: $(yaml_quote "~^${PATH_PREFIX}/.*$")"
+        local auth_path
+        for auth_path in "${authorized_paths[@]}"; do
+            echo "      - action: publish"
+            echo "        path: $(yaml_quote "$auth_path")"
+            echo "      - action: read"
+            echo "        path: $(yaml_quote "$auth_path")"
+        done
         echo
         echo "rtsp: true"
         echo "rtspAddress: :${RTSP_PORT}"
@@ -364,11 +408,18 @@ main() {
         echo
         echo "paths:"
 
-        local channel path file name
-        channel="$CHANNEL_BASE"
+        local channel path name
         for file in "${files[@]}"; do
             name="$(basename "$file")"
-            path="${PATH_PREFIX}/${channel}"
+
+            if [[ -n "${existing_channel_by_file[$file]:-}" ]]; then
+                channel="${existing_channel_by_file[$file]}"
+                path="${existing_path_by_file[$file]}"
+            else
+                max_channel=$((max_channel + 1))
+                channel="$max_channel"
+                path="${PATH_PREFIX}/${channel}"
+            fi
 
             printf '%s\t%s\t%s\n' "$channel" "$path" "$file" >> "$STREAM_MAP_FILE"
 
@@ -377,12 +428,12 @@ main() {
             echo "    runOnInit: $(yaml_quote "$PUBLISHER_SCRIPT")"
             echo "    runOnInitRestart: yes"
             echo
-
-            channel=$((channel + 1))
         done
     } > "$OUTPUT_YAML"
 
     chmod 600 "$OUTPUT_YAML" "$STREAM_MAP_FILE"
+    printf '%s\n' "$max_channel" > "$max_channel_file"
+    chmod 600 "$max_channel_file"
 }
 
 main "$@"
