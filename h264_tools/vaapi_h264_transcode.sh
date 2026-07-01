@@ -10,6 +10,7 @@ VIDEO_BITRATE="12M"
 MAXRATE="16M"
 BUFSIZE="24M"
 AUDIO_BITRATE="128k"
+WEBRTC_COMPATIBLE="no"
 
 usage() {
     cat <<USAGE
@@ -28,10 +29,13 @@ Optional:
   -m MAXRATE        Video maxrate, default: 16M
   -u BUFSIZE        Video bufsize, default: 24M
   -a AUDIO_BITRATE  Audio bitrate, default: 128k
+  -w                Generate WebRTC-compatible MP4:
+                    H.264 constrained baseline, no B-frames, Opus audio
   -h                Show this help
 
 Example:
   $0 -i Bears.webm -o Bears_h264_20fps_gop2s.mp4 -f 20 -g 2
+  $0 -i Bears.webm -o Bears_webrtc.mp4 -f 20 -g 2 -w
 
 USAGE
 }
@@ -201,10 +205,16 @@ check_vainfo_h264_encode() {
         die "VAAPI H.264 hardware encode is not supported. Missing VAProfileH264* : VAEntrypointEncSlice"
     fi
 
-    # The FFmpeg command below uses '-profile:v high', so check High profile explicitly.
-    # If only Main/Baseline encode exists, h264_vaapi might still encode after changing '-profile:v'.
-    if ! grep -E "VAProfileH264High[[:space:]]*:[[:space:]]*VAEntrypointEncSlice" "$h264_caps" >/dev/null 2>&1; then
-        warn "VAProfileH264High EncSlice was not found. The script uses '-profile:v high'; change the profile if FFmpeg fails."
+    if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then
+        if ! grep -E "VAProfileH264(ConstrainedBaseline|Baseline)[[:space:]]*:[[:space:]]*VAEntrypointEncSlice" "$h264_caps" >/dev/null 2>&1; then
+            warn "VAProfileH264 ConstrainedBaseline/Baseline EncSlice was not found. WebRTC-compatible mode may fail on this VAAPI driver."
+        fi
+    else
+        # The default FFmpeg command uses '-profile:v high', so check High profile explicitly.
+        # If only Main/Baseline encode exists, h264_vaapi might still encode after changing '-profile:v'.
+        if ! grep -E "VAProfileH264High[[:space:]]*:[[:space:]]*VAEntrypointEncSlice" "$h264_caps" >/dev/null 2>&1; then
+            warn "VAProfileH264High EncSlice was not found. The script uses '-profile:v high'; change the profile if FFmpeg fails."
+        fi
     fi
 
     rm -f "$tmp" "$h264_caps"
@@ -235,7 +245,7 @@ check_output_path() {
     [[ -w "$outdir" ]] || die "Output directory is not writable: $outdir"
 }
 
-while getopts ":i:o:f:g:d:b:m:u:a:h" opt; do
+while getopts ":i:o:f:g:d:b:m:u:a:wh" opt; do
     case "$opt" in
         i) INPUT="$OPTARG" ;;
         o) OUTPUT="$OPTARG" ;;
@@ -246,6 +256,7 @@ while getopts ":i:o:f:g:d:b:m:u:a:h" opt; do
         m) MAXRATE="$OPTARG" ;;
         u) BUFSIZE="$OPTARG" ;;
         a) AUDIO_BITRATE="$OPTARG" ;;
+        w) WEBRTC_COMPATIBLE="yes" ;;
         h)
             usage
             exit 0
@@ -274,6 +285,21 @@ need_cmd vainfo
 DEVICE="$(detect_vaapi_device)"
 GOP_FRAMES="$(calc_gop_frames "$FPS" "$GOP_SEC")"
 FPS_FLOAT="$(fps_to_float "$FPS")"
+VIDEO_PROFILE="high"
+VIDEO_BFRAME_ARGS=()
+VIDEO_CODER_ARGS=()
+AUDIO_CODEC_ARGS=(-c:a aac -b:a "$AUDIO_BITRATE")
+
+if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then
+    need_cmd ffmpeg
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "^[[:space:]]*A.*libopus[[:space:]]" \
+        || die "This FFmpeg build does not support encoder: libopus"
+
+    VIDEO_PROFILE="constrained_baseline"
+    VIDEO_BFRAME_ARGS=(-bf 0)
+    VIDEO_CODER_ARGS=(-coder cavlc)
+    AUDIO_CODEC_ARGS=(-c:a libopus -b:a "$AUDIO_BITRATE")
+fi
 
 log "Checking input file..."
 check_input_video "$INPUT"
@@ -303,10 +329,13 @@ echo "  FPS float    : $FPS_FLOAT"
 echo "  GOP seconds  : $GOP_SEC"
 echo "  GOP frames   : $GOP_FRAMES"
 echo "  Video codec  : h264_vaapi"
+echo "  Video profile: $VIDEO_PROFILE"
+echo "  B-frames     : $(if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then echo "disabled"; else echo "encoder default"; fi)"
 echo "  Bitrate      : $VIDEO_BITRATE"
 echo "  Maxrate      : $MAXRATE"
 echo "  Bufsize      : $BUFSIZE"
-echo "  Audio codec  : AAC"
+echo "  Audio codec  : $(if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then echo "Opus"; else echo "AAC"; fi)"
+echo "  WebRTC mode  : $WEBRTC_COMPATIBLE"
 echo "  Output       : $OUTPUT"
 
 log "Starting FFmpeg..."
@@ -317,14 +346,15 @@ ffmpeg -hide_banner -y \
     -map 0:v:0 -map 0:a? \
     -vf "fps=${FPS},format=nv12,hwupload" \
     -c:v h264_vaapi \
-    -profile:v high \
+    -profile:v "$VIDEO_PROFILE" \
+    "${VIDEO_BFRAME_ARGS[@]}" \
+    "${VIDEO_CODER_ARGS[@]}" \
     -g "$GOP_FRAMES" \
     -force_key_frames "expr:gte(t,n_forced*${GOP_SEC})" \
     -b:v "$VIDEO_BITRATE" \
     -maxrate "$MAXRATE" \
     -bufsize "$BUFSIZE" \
-    -c:a aac \
-    -b:a "$AUDIO_BITRATE" \
+    "${AUDIO_CODEC_ARGS[@]}" \
     -movflags +faststart \
     "$OUTPUT"
 
@@ -333,8 +363,18 @@ log "Transcode completed."
 log "Verifying output video stream..."
 ffprobe -hide_banner \
     -select_streams v:0 \
-    -show_entries stream=codec_name,width,height,avg_frame_rate,r_frame_rate,pix_fmt \
+    -show_entries stream=codec_name,profile,width,height,avg_frame_rate,r_frame_rate,pix_fmt \
     -of default=nw=1 "$OUTPUT"
+
+if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then
+    log "Verifying WebRTC-compatible output..."
+    if ffprobe -v error \
+        -select_streams v:0 \
+        -show_entries frame=pict_type \
+        -of csv=p=0 "$OUTPUT" | grep -qx "B"; then
+        die "Output still contains H.264 B-frames; WebRTC playback through MediaMTX can fail."
+    fi
+fi
 
 log "First keyframes:"
 ffprobe -v error \
