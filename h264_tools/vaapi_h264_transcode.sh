@@ -289,16 +289,24 @@ VIDEO_PROFILE="high"
 VIDEO_BFRAME_ARGS=()
 VIDEO_CODER_ARGS=()
 AUDIO_CODEC_ARGS=(-c:a aac -b:a "$AUDIO_BITRATE")
+AUDIO_CODEC_LABEL="AAC"
 
 if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then
-    need_cmd ffmpeg
-    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "^[[:space:]]*A.*libopus[[:space:]]" \
-        || die "This FFmpeg build does not support encoder: libopus"
-
     VIDEO_PROFILE="constrained_baseline"
     VIDEO_BFRAME_ARGS=(-bf 0)
     VIDEO_CODER_ARGS=(-coder cavlc)
-    AUDIO_CODEC_ARGS=(-c:a libopus -b:a "$AUDIO_BITRATE")
+
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "^[[:space:]]*A.*libopus[[:space:]]"; then
+        AUDIO_CODEC_ARGS=(-c:a libopus -b:a "$AUDIO_BITRATE")
+        AUDIO_CODEC_LABEL="Opus (libopus)"
+    elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "^[[:space:]]*A.*opus[[:space:]]"; then
+        AUDIO_CODEC_ARGS=(-strict -2 -c:a opus -b:a "$AUDIO_BITRATE")
+        AUDIO_CODEC_LABEL="Opus (native)"
+    else
+        warn "No Opus encoder found. WebRTC-compatible mode will disable audio."
+        AUDIO_CODEC_ARGS=(-an)
+        AUDIO_CODEC_LABEL="disabled"
+    fi
 fi
 
 log "Checking input file..."
@@ -334,7 +342,7 @@ echo "  B-frames     : $(if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then echo "disa
 echo "  Bitrate      : $VIDEO_BITRATE"
 echo "  Maxrate      : $MAXRATE"
 echo "  Bufsize      : $BUFSIZE"
-echo "  Audio codec  : $(if [[ "$WEBRTC_COMPATIBLE" == "yes" ]]; then echo "Opus"; else echo "AAC"; fi)"
+echo "  Audio codec  : $AUDIO_CODEC_LABEL"
 echo "  WebRTC mode  : $WEBRTC_COMPATIBLE"
 echo "  Output       : $OUTPUT"
 
